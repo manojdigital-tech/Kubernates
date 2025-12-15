@@ -1,0 +1,174 @@
+
+name: Kubernetes + Dynatrace + OTel (Sock Shop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "Target cluster provider"
+        type: choice
+        options: [ "eks", "minikube" ]
+        default: "eks"
+      cluster_name:
+        description: "Cluster name (EKS) or context (Minikube)"
+        default: "obs-demo"
+      eks_region:
+        description: "AWS region for EKS"
+        default: "ap-southeast-2"
+      sockshop_namespace:
+        description: "Namespace for Sock Shop"
+        default: "sock-shop"
+
+env:
+  DT_ENV_ID: ${{ secrets.DT_ENV_ID }}
+  DT_API_TOKEN: ${{ secrets.DT_API_TOKEN }}
+  DT_INGEST_TOKEN: ${{ secrets.DT_INGEST_TOKEN }}
+  DT_ENV_URL: https://${{ secrets.DT_ENV_ID }}.live.dynatrace.com/api
+  # Sock Shop manifest (archived repo still serves the combined manifest; alternative fallback below)
+  SOCKSHOP_MANIFEST_URL: https://raw.githubusercontent.com/microservices-demo/microservices-demo/master/deploy/kubernetes/complete-demo.yaml
+
+jobs:
+  setup-observability:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🧩 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install prerequisites (kubectl, helm, eksctl, jq)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git
+          # kubectl
+          curl -Lo kubectl "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install kubectl /usr/local/bin/kubectl
+          rm kubectl
+          # helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          # eksctl (for EKS)
+          curl -sL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin/eksctl
+
+      - name: 🔐 Configure AWS (for EKS)
+        if: ${{ inputs.provider == 'eks' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ inputs.eks_region }}
+
+      - name: ☁️ Create EKS cluster (managed nodes)
+        if: ${{ inputs.provider == 'eks' }}
+        run: |
+          eksctl create cluster \
+            --name "${{ inputs.cluster_name }}" \
+            --region "${{ inputs.eks_region }}" \
+            --managed \
+            --nodes 2 --node-type t3.large \
+            --version 1.29
+          aws eks update-kubeconfig --region "${{ inputs.eks_region }}" --name "${{ inputs.cluster_name }}"
+        # EKS quickstart via eksctl. [5](https://docs.aws.amazon.com/eks/latest/userguide/auto-cluster-iam-role.html)
+
+      - name: 🔒 Ensure EKS cluster IAM role trust policy allows sts:TagSession (Auto Mode compat)
+        if: ${{ inputs.provider == 'eks' }}
+        run: |
+          ROLE_ARN=$(aws eks describe-cluster --region "${{ inputs.eks_region }}" --name "${{ inputs.cluster_name }}" --query 'cluster.roleArn' -o text)
+          ROLE_NAME=$(echo "$ROLE_ARN" | awk -F/ '{print $NF}')
+          cat > trust.json << 'JSON'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Service": "eks.amazonaws.com" },
+                "Action": [ "sts:AssumeRole", "sts:TagSession" ]
+              }
+            ]
+          }
+          JSON
+          aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document file://trust.json
+        # EKS Auto Mode & cluster role trust policy requires sts:TagSession. [3](https://gremlin.awsworkshop.io/34_setup_sockshop_gremlin/20_deploy_sockshop.html)[4](https://opentelemetry.io/docs/languages/sdk-configuration/otlp-exporter/)
+        # Updating trust policy via IAM is supported. [6](https://weaveworks-gitops.awsworkshop.io/22_workshop_1/40_deploy_sample_app.html)
+
+      - name: 💻 Start Minikube (local)
+        if: ${{ inputs.provider == 'minikube' }}
+        uses: medyagh/setup-minikube@v0.0.14
+
+      - name: 🔍 Verify cluster
+        run: |
+          kubectl version --client
+          kubectl get nodes -o wide
+
+      - name: 🧦 Deploy Sock Shop (namespace + app)
+        run: |
+          kubectl create namespace "${{ inputs.sockshop_namespace }}" || true
+          # Try primary archived repo, fallback to tilt-dev fork if needed
+          set -e
+          curl -fsSL "$SOCKSHOP_MANIFEST_URL" | kubectl apply -n "${{ inputs.sockshop_namespace }}" -f - || \
+          curl -fsSL "https://raw.githubusercontent.com/tilt-dev/microservices-demo-deploy/master/deploy/kubernetes/complete-demo.yaml" | kubectl apply -n "${{ inputs.sockshop_namespace }}" -f -
+          kubectl get pods -n "${{ inputs.sockshop_namespace }}"
+        # Sock Shop manifests & deployments. [7](https://dynatrace.awsworkshop.io/90_aws-lab6/5_dynatrace_operator_installation_walk-through.html)[8](https://docs.aws.amazon.com/eks/latest/userguide/getting-started-eksctl.html)
+
+      - name: 🕰️ Wait for Sock Shop to be ready
+        run: |
+          bash scripts/wait_for_ready.sh "${{ inputs.sockshop_namespace }}" 900
+
+      - name: 🧠 Dynatrace | Prepare namespace + secrets
+        run: |
+          kubectl create namespace dynatrace || true
+          kubectl -n dynatrace create secret generic dynakube \
+            --from-literal=apiToken="${DT_API_TOKEN}" \
+            --from-literal=dataIngestToken="${DT_INGEST_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          # Render DynaKube CR from template with envsubst
+          export DT_ENV_URL="${DT_ENV_URL}"
+          envsubst < manifests/dynakube.tmpl.yaml | tee dynakube.yaml
+          kubectl apply -f dynakube.yaml
+        # Dynatrace Operator & DynaKube CR use Helm + CRD; apiUrl and tokens are required. [9](https://docs.aws.amazon.com/eks/latest/userguide/auto-enable-existing.html)[10](https://dev.to/aws-builders/assign-an-iam-role-to-a-kubernetes-service-account-3nc7)
+
+      - name: 🧠 Dynatrace | Install Operator (Helm OCI)
+        run: |
+          helm install dynatrace-operator oci://public.ecr.aws/dynatrace/dynatrace-operator -n dynatrace --create-namespace
+          kubectl -n dynatrace get pods
+        # Helm OCI install for Dynatrace Operator. [9](https://docs.aws.amazon.com/eks/latest/userguide/auto-enable-existing.html)
+
+      - name: 📦 OpenTelemetry Collector | Gateway to Dynatrace OTLP/HTTP
+        run: |
+          kubectl create namespace observability || true
+          kubectl -n observability create secret generic dynatrace-otlp \
+            --from-literal=apiToken="${DT_API_TOKEN}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          export DT_OTLP_BASE="https://${DT_ENV_ID}.live.dynatrace.com/api/v2/otlp"
+          envsubst < manifests/otel-collector.tmpl.yaml | tee otel-collector.yaml
+          kubectl apply -f otel-collector.yaml
+          kubectl -n observability get pods
+        # Dynatrace supports OTLP/HTTP for traces, metrics, logs via /api/v2/otlp. Use Api-Token header. [1](https://knowledge.businesscompassllc.com/build-configure-deploy-full-eks-cluster-creation-tutorial-with-eksctl/)
+        # OTel Collector deployment in Kubernetes (gateway/agent patterns). [11](https://devopspilot.com/kubernetes/tutorials/how-to-install-minikube-in-linux/)
+
+      - name: 🕰️ Wait for Dynatrace + OTel pods
+        run: |
+          bash scripts/wait_for_ready.sh dynatrace 600
+          bash scripts/wait_for_ready.sh observability 600
+
+      - name: 🔎 Basic validation / diagnostics
+        run: |
+          set -e
+          echo "== Namespaces =="
+          kubectl get ns
+          echo "== Pods (sock-shop) =="
+          kubectl get pods -n "${{ inputs.sockshop_namespace }}"
+          echo "== Pods (dynatrace) =="
+          kubectl get pods -n dynatrace
+          echo "== Pods (observability) =="
+          kubectl get pods -n observability
+          echo "== OTel Collector logs =="
+          kubectl -n observability logs deploy/otel-collector-gateway --tail=200 || true
+
+      - name: 📦 Upload artifacts (kubectl describe, logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-outputs
+          path: |
+            dynakube.yaml
+            otel-collector.yaml
+            /home/runner/.kube/config
