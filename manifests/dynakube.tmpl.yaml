@@ -1,0 +1,30 @@
+
+apiVersion: dynatrace.com/v1beta1
+kind: DynaKube
+metadata:
+  name: dynakube
+  namespace: dynatrace
+spec:
+  # Kubernetes platform monitoring (API metrics, events)
+  kubernetesMonitoring:
+    enabled: true
+
+  # Application auto-injection via webhook (Cloud‑Native Full‑Stack)
+  applicationMonitoring:
+    enabled: true
+    # Optionally limit injection to specific namespaces by label
+    # namespaceSelector:
+    #   matchLabels:
+    #     dynatrace-injection: enabled
+
+  # CSI driver improves OneAgent distribution efficiency
+  csi:
+    enabled: true
+
+  oneAgent:
+    autoUpdate: true
+
+  tokens:
+    name: dynakube
+
+  # REQUIRED: Dynatrace environment URL
