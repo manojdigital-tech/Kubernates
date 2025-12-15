@@ -1,3 +1,4 @@
+-name: OpenTelemetry Collector (Gateway → Dynatrace OTLP/HTTP)
 
 apiVersion: v1
 kind: ConfigMap
