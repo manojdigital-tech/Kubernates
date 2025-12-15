@@ -1,4 +1,4 @@
-- name: auto‑injection + K8s platform monitoring
+- name:  auto‑injection + K8s platform monitoring
 apiVersion: dynatrace.com/v1beta1
 kind: DynaKube
 metadata:
